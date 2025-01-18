@@ -25,7 +25,7 @@ pub struct BlockResponse {
 pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockResponse> {
     let client = &state.client;
 
-    // Use the `blocks()` API to fetch the latest block
+    // Fetch the latest block
     let block = client
         .blocks()
         .at_latest()
@@ -35,7 +35,7 @@ pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockRespon
     let block_number = block.header().number;
     let block_hash = block.hash();
 
-    // Extract and format individual extrinsics
+    // Extract extrinsics
     let extrinsics_data = block
         .extrinsics()
         .await
@@ -52,13 +52,10 @@ pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockRespon
         })
         .collect::<Vec<_>>();
 
-    // Create the response
-    let response = BlockResponse {
+    // Return the block response as JSON
+    Json(BlockResponse {
         hash: format!("{:?}", block_hash),
         number: block_number,
         extrinsics,
-    };
-
-    // Return the response as JSON
-    Json(response)
+    })
 }
