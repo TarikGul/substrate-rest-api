@@ -15,6 +15,8 @@ pub struct AppState {
 pub struct ExtrinsicInfo {
     pub method: ExtrinsicMethod,
     pub signature: Option<String>,
+    pub nonce: Option<String>,
+    pub tip: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -136,6 +138,20 @@ fn transform_extrinsics(
             let signature = extrinsic
                 .signature_bytes()
                 .map(|bytes| format!("0x{}", hex::encode(bytes)));
+            // Extract nonce and tip
+            let nonce = extrinsic
+                .signed_extensions()
+                .iter()
+                .filter_map(|ext| ext.nonce()) // Get nonce if it exists
+                .next()
+                .map(|nonce| nonce.to_string()); // Convert to string if present
+
+            let tip = extrinsic
+                .signed_extensions()
+                .iter()
+                .filter_map(|ext| ext.tip()) // Get tip if it exists
+                .next()
+                .map(|tip| tip.to_string()); // Convert to string if present
 
             ExtrinsicInfo {
                 method: ExtrinsicMethod {
@@ -143,6 +159,8 @@ fn transform_extrinsics(
                     method: method.to_string(),
                 },
                 signature,
+                nonce,
+                tip,
             }
         })
         .collect()
