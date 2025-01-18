@@ -32,7 +32,7 @@ async fn main() {
     tracing::info!("Starting server on http://{}", addr);
 
     let app = Router::new()
-        .route("/blocks/latest", get(get_latest_block))
+        .route("/blocks/head", get(get_latest_block))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(
