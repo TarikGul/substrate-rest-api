@@ -5,6 +5,7 @@ use std::sync::Arc;
 use subxt::blocks::Extrinsics;
 use subxt::config::substrate::{DigestItem, H256};
 use subxt::{OnlineClient, PolkadotConfig};
+use subxt::ext::scale_value::Composite;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,6 +18,7 @@ pub struct ExtrinsicInfo {
     pub signature: Option<String>,
     pub nonce: Option<String>,
     pub tip: Option<String>,
+    pub events: Vec<Composite<u32>>
 }
 
 #[derive(Serialize)]
@@ -66,7 +68,7 @@ pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockRespon
         .await
         .expect("Failed to fetch extrinsics");
 
-    let extrinsics = transform_extrinsics(extrinsics_data);
+    let extrinsics = transform_extrinsics(extrinsics_data).await;
 
     // Return the block response as JSON
     Json(BlockResponse {
@@ -126,42 +128,60 @@ pub fn transform_logs(logs: &[DigestItem]) -> Vec<LogEntry> {
         .collect()
 }
 
-fn transform_extrinsics(
+async fn transform_extrinsics(
     extrinsics: Extrinsics<PolkadotConfig, OnlineClient<PolkadotConfig>>,
 ) -> Vec<ExtrinsicInfo> {
-    extrinsics
-        .iter()
-        .enumerate()
-        .map(|(_, extrinsic)| {
-            let pallet = extrinsic.pallet_name().unwrap_or_else(|_| "Unknown");
-            let method = extrinsic.variant_name().unwrap_or_else(|_| "Unknown");
-            let signature = extrinsic
-                .signature_bytes()
-                .map(|bytes| format!("0x{}", hex::encode(bytes)));
-            // Extract nonce and tip
-            let nonce = extrinsic
-                .signed_extensions()
-                .iter()
-                .filter_map(|ext| ext.nonce()) // Get nonce if it exists
-                .next()
-                .map(|nonce| nonce.to_string()); // Convert to string if present
+    let mut result = Vec::new();
 
-            let tip = extrinsic
-                .signed_extensions()
-                .iter()
-                .filter_map(|ext| ext.tip()) // Get tip if it exists
-                .next()
-                .map(|tip| tip.to_string()); // Convert to string if present
+    for (_, extrinsic) in extrinsics.iter().enumerate() {
+        let pallet = extrinsic.pallet_name().unwrap_or_else(|_| "Unknown");
+        let method = extrinsic.variant_name().unwrap_or_else(|_| "Unknown");
+        let signature = extrinsic
+            .signature_bytes()
+            .map(|bytes| format!("0x{}", hex::encode(bytes)));
 
-            ExtrinsicInfo {
-                method: ExtrinsicMethod {
-                    pallet: pallet.to_string(),
-                    method: method.to_string(),
-                },
-                signature,
-                nonce,
-                tip,
-            }
-        })
-        .collect()
+        let nonce = extrinsic
+            .signed_extensions()
+            .iter()
+            .filter_map(|ext| ext.nonce())
+            .next()
+            .map(|nonce| nonce.to_string());
+
+        let tip = extrinsic
+            .signed_extensions()
+            .iter()
+            .filter_map(|ext| ext.tip())
+            .next()
+            .map(|tip| tip.to_string());
+
+        // Fetch events asynchronously
+        let events = extrinsic.events().await.unwrap();
+
+        // Extract field values from events
+        let event_info = events
+            .iter()
+            .filter_map(|event| {
+                match event {
+                    Ok(e) => e.field_values().ok(), // Extract field values if valid
+                    Err(err) => {
+                        tracing::error!("Error processing event: {:?}", err);
+                        None
+                    }
+                }
+            })
+            .collect(); // Collect valid field values
+
+        result.push(ExtrinsicInfo {
+            method: ExtrinsicMethod {
+                pallet: pallet.to_string(),
+                method: method.to_string(),
+            },
+            signature,
+            nonce,
+            tip,
+            events: event_info, // Add events to ExtrinsicInfo
+        });
+    }
+
+    result
 }
