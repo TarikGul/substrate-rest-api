@@ -2,8 +2,8 @@ use axum::{extract::State, response::Json};
 use hex;
 use serde::Serialize;
 use std::sync::Arc;
-use subxt::config::substrate::DigestItem;
-use subxt::config::substrate::H256;
+use subxt::blocks::Extrinsics;
+use subxt::config::substrate::{DigestItem, H256};
 use subxt::{OnlineClient, PolkadotConfig};
 
 #[derive(Clone)]
@@ -13,8 +13,8 @@ pub struct AppState {
 
 #[derive(Serialize)]
 pub struct ExtrinsicInfo {
-    pub index: usize,
-    pub pallet_name: String,
+    pub method: ExtrinsicMethod,
+    pub signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -33,6 +33,12 @@ pub struct LogEntry {
     log_type: String,
     index: String,
     value: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct ExtrinsicMethod {
+    pallet: String,
+    method: String,
 }
 
 pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockResponse> {
@@ -58,16 +64,7 @@ pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockRespon
         .await
         .expect("Failed to fetch extrinsics");
 
-    let extrinsics = extrinsics_data
-        .iter()
-        .enumerate()
-        .map(|(index, ext)| ExtrinsicInfo {
-            index,
-            pallet_name: ext
-                .pallet_name()
-                .map_or_else(|err| format!("Error: {}", err), |name| name.to_string()),
-        })
-        .collect::<Vec<_>>();
+    let extrinsics = transform_extrinsics(extrinsics_data);
 
     // Return the block response as JSON
     Json(BlockResponse {
@@ -122,6 +119,30 @@ pub fn transform_logs(logs: &[DigestItem]) -> Vec<LogEntry> {
                     index: index.to_string(),
                     value: vec![], // No associated data
                 },
+            }
+        })
+        .collect()
+}
+
+fn transform_extrinsics(
+    extrinsics: Extrinsics<PolkadotConfig, OnlineClient<PolkadotConfig>>,
+) -> Vec<ExtrinsicInfo> {
+    extrinsics
+        .iter()
+        .enumerate()
+        .map(|(_, extrinsic)| {
+            let pallet = extrinsic.pallet_name().unwrap_or_else(|_| "Unknown");
+            let method = extrinsic.variant_name().unwrap_or_else(|_| "Unknown");
+            let signature = extrinsic
+                .signature_bytes()
+                .map(|bytes| format!("0x{}", hex::encode(bytes)));
+
+            ExtrinsicInfo {
+                method: ExtrinsicMethod {
+                    pallet: pallet.to_string(),
+                    method: method.to_string(),
+                },
+                signature,
             }
         })
         .collect()
