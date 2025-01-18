@@ -1,40 +1,18 @@
-use axum::{
-    extract::State,
-    response::Json,
-    routing::get,
-    Router,
-};
-use serde::Serialize;
-use subxt::{OnlineClient, PolkadotConfig};
+mod routes;
+
+use axum::{routing::get, Router};
+use routes::blocks::{get_latest_block, AppState};
 use std::sync::Arc;
+use subxt::{OnlineClient, PolkadotConfig};
 use tracing_subscriber;
-
-#[derive(Clone)]
-struct AppState {
-    client: Arc<OnlineClient<PolkadotConfig>>,
-}
-
-#[derive(Serialize)]
-struct ExtrinsicInfo {
-    index: usize,
-    pallet_name: String,
-}
-
-#[derive(Serialize)]
-struct BlockResponse {
-    hash: String,
-    number: u32,
-    extrinsics: Vec<ExtrinsicInfo>,
-}
 
 #[tokio::main]
 async fn main() {
     // Initialize tracing for logging
-    // Set up a default tracing subscriber with INFO level
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO) // Set the maximum log level
-        .with_target(true) // Show target/module path in logs
-        .with_thread_ids(true) // Show thread IDs for debugging (optional)
+        .with_max_level(tracing::Level::INFO)
+        .with_target(true)
+        .with_thread_ids(true)
         .init();
 
     // Specify the WebSocket URL of the Substrate node
@@ -74,50 +52,4 @@ async fn main() {
 
     // Log server termination (if any)
     tracing::info!("Server stopped");
-}
-
-// Handler to fetch the latest block
-async fn get_latest_block(
-    State(state): State<AppState>,
-) -> Json<BlockResponse> {
-    let client = &state.client;
-
-    // Use the `blocks()` API to fetch the latest block
-    let block = client
-        .blocks()
-        .at_latest()
-        .await
-        .expect("Failed to fetch the latest block");
-
-    let block_number = block.header().number;
-    let block_hash = block.hash();
-
-    // Extract and format individual extrinsics
-    let extrinsics_data = block
-        .extrinsics()
-        .await
-        .expect("Failed to fetch extrinsics");
-
-    let extrinsics = extrinsics_data
-        .iter()
-        .enumerate()
-        .map(|(index, ext)| ExtrinsicInfo {
-            index,
-            pallet_name: ext.pallet_name().map_or_else(|err| format!("Error: {}", err), |name| name.to_string()), 
-        })
-        .collect::<Vec<_>>();
-
-    // Create the response
-    let response = BlockResponse {
-        hash: format!("{:?}", block_hash),
-        number: block_number,
-        extrinsics,
-    };
-
-    // Print the response as JSON to the console
-    let json = serde_json::to_string_pretty(&response).expect("Failed to serialize to JSON");
-    println!("{}", json);
-
-    // Return the response as JSON
-    Json(response)
 }
