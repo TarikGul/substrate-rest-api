@@ -1,0 +1,15 @@
+[package]
+name = "substrate-api-sidecar-rewrite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.6"
+tokio = { version = "1", features = ["full"] }
+subxt = { version = "0.38" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+parity-scale-codec = "3.1"
