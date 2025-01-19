@@ -4,8 +4,8 @@ use serde::Serialize;
 use std::sync::Arc;
 use subxt::blocks::Extrinsics;
 use subxt::config::substrate::{DigestItem, H256};
-use subxt::{OnlineClient, PolkadotConfig};
 use subxt::ext::scale_value::Composite;
+use subxt::{OnlineClient, PolkadotConfig};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,7 +18,9 @@ pub struct ExtrinsicInfo {
     pub signature: Option<String>,
     pub nonce: Option<String>,
     pub tip: Option<String>,
-    pub events: Vec<Composite<u32>>
+    pub hash: H256,
+    pub args: Option<Composite<u32>>,
+    pub events: Vec<Composite<u32>>,
 }
 
 #[derive(Serialize)]
@@ -136,6 +138,8 @@ async fn transform_extrinsics(
     for (_, extrinsic) in extrinsics.iter().enumerate() {
         let pallet = extrinsic.pallet_name().unwrap_or_else(|_| "Unknown");
         let method = extrinsic.variant_name().unwrap_or_else(|_| "Unknown");
+        let hash = extrinsic.hash();
+        let args = extrinsic.field_values().ok();
         let signature = extrinsic
             .signature_bytes()
             .map(|bytes| format!("0x{}", hex::encode(bytes)));
@@ -179,6 +183,8 @@ async fn transform_extrinsics(
             signature,
             nonce,
             tip,
+            hash,
+            args,
             events: event_info, // Add events to ExtrinsicInfo
         });
     }

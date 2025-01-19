@@ -19,7 +19,7 @@ impl Config {
             .parse()
             .expect("APP_PORT must be a valid number");
         let log_level = env::var("LOG_LEVEL")
-            .ok() 
+            .ok()
             .and_then(|level| level.parse::<Level>().ok())
             .unwrap_or(Level::INFO);
 
