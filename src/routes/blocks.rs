@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use subxt::blocks::Extrinsics;
 use subxt::config::substrate::{AccountId32, DigestItem, H256};
-use subxt::ext::scale_value::Composite;
+use subxt::ext::scale_value::{Composite, Primitive, Value, ValueDef};
 use subxt::{OnlineClient, PolkadotConfig};
 
 #[derive(Clone)]
@@ -19,7 +19,7 @@ pub struct ExtrinsicInfo {
     pub nonce: Option<String>,
     pub tip: Option<String>,
     pub hash: H256,
-    pub args: Option<Composite<u32>>,
+    pub args: Option<serde_json::Value>,
     pub events: Vec<Composite<u32>>,
 }
 
@@ -242,7 +242,6 @@ async fn transform_extrinsics(
         let pallet = extrinsic.pallet_name().unwrap_or_else(|_| "Unknown");
         let method = extrinsic.variant_name().unwrap_or_else(|_| "Unknown");
         let hash = extrinsic.hash();
-        let args = extrinsic.field_values().ok();
         let signature = extrinsic
             .signature_bytes()
             .map(|bytes| format!("0x{}", hex::encode(bytes)));
@@ -261,22 +260,23 @@ async fn transform_extrinsics(
             .next()
             .map(|tip| tip.to_string());
 
+        // Extract arguments
+        let args = serialize_args(extrinsic.field_values().ok());
+
         // Fetch events asynchronously
         let events = extrinsic.events().await.unwrap();
 
         // Extract field values from events
         let event_info = events
             .iter()
-            .filter_map(|event| {
-                match event {
-                    Ok(e) => e.field_values().ok(), // Extract field values if valid
-                    Err(err) => {
-                        tracing::error!("Error processing event: {:?}", err);
-                        None
-                    }
+            .filter_map(|event| match event {
+                Ok(e) => e.field_values().ok(),
+                Err(err) => {
+                    tracing::error!("Error processing event: {:?}", err);
+                    None
                 }
             })
-            .collect(); // Collect valid field values
+            .collect();
 
         result.push(ExtrinsicInfo {
             method: ExtrinsicMethod {
@@ -288,11 +288,92 @@ async fn transform_extrinsics(
             tip,
             hash,
             args,
-            events: event_info, // Add events to ExtrinsicInfo
+            events: event_info,
         });
     }
 
     result
+}
+
+fn serialize_args(args: Option<Composite<u32>>) -> Option<serde_json::Value> {
+    args.map(|composite| match composite {
+        Composite::Named(named_fields) => {
+            let obj: serde_json::Map<String, serde_json::Value> = named_fields
+                .into_iter()
+                .map(|(key, value)| (key, serialize_value(value)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        Composite::Unnamed(unnamed_fields) => {
+            let array: Vec<serde_json::Value> =
+                unnamed_fields.into_iter().map(serialize_value).collect();
+            serde_json::Value::Array(array)
+        }
+    })
+}
+
+fn serialize_value(value: Value<u32>) -> serde_json::Value {
+    match value.value {
+        ValueDef::Primitive(primitive) => match primitive {
+            Primitive::Bool(b) => serde_json::Value::Bool(b),
+            Primitive::Char(c) => serde_json::Value::String(c.to_string()),
+            Primitive::String(s) => serde_json::Value::String(s),
+            Primitive::U128(num) => serde_json::Value::String(num.to_string()),
+            Primitive::I128(num) => serde_json::Value::String(num.to_string()),
+            Primitive::U256(bytes) | Primitive::I256(bytes) => {
+                serde_json::Value::String(format!("0x{}", hex::encode(bytes)))
+            }
+        },
+        ValueDef::Composite(composite) => serialize_composite(composite),
+        ValueDef::Variant(variant) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert(
+                "variant".to_string(),
+                serde_json::Value::String(variant.name),
+            );
+            obj.insert(
+                "fields".to_string(),
+                serde_json::Value::Array(
+                    variant.values.into_values().map(serialize_value).collect(),
+                ),
+            );
+            serde_json::Value::Object(obj)
+        }
+        ValueDef::BitSequence(bits) => serde_json::Value::String(format!("{:?}", bits)),
+    }
+}
+
+fn serialize_composite(composite: Composite<u32>) -> serde_json::Value {
+    match composite {
+        Composite::Named(named_fields) => {
+            let obj: serde_json::Map<String, serde_json::Value> = named_fields
+                .into_iter()
+                .map(|(key, value)| (key, serialize_value(value)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        Composite::Unnamed(unnamed_fields) => {
+            // Check if this is a byte array
+            if unnamed_fields
+                .iter()
+                .all(|v| matches!(v.value, ValueDef::Primitive(Primitive::U128(_))))
+            {
+                // Convert unnamed fields into a hex string
+                let bytes: Vec<u8> = unnamed_fields
+                    .into_iter()
+                    .filter_map(|v| match v.value {
+                        ValueDef::Primitive(Primitive::U128(num)) if num <= 255 => Some(num as u8),
+                        _ => None,
+                    })
+                    .collect();
+                serde_json::Value::String(format!("0x{}", hex::encode(bytes)))
+            } else {
+                let array: Vec<serde_json::Value> =
+                    unnamed_fields.into_iter().map(serialize_value).collect();
+                serde_json::Value::Array(array)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
