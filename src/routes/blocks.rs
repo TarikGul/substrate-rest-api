@@ -1,9 +1,12 @@
 use axum::{extract::State, response::Json};
 use hex;
 use serde::Serialize;
+use sp_consensus_babe::digests::PreDigest;
 use std::sync::Arc;
 use subxt::blocks::Extrinsics;
+use subxt::config::substrate::ConsensusEngineId;
 use subxt::config::substrate::{AccountId32, DigestItem, H256};
+use subxt::ext::codec::Decode;
 use subxt::ext::scale_value::{Composite, Primitive, Value, ValueDef};
 use subxt::{OnlineClient, PolkadotConfig};
 
@@ -48,10 +51,15 @@ pub struct ExtrinsicMethod {
     method: String,
 }
 
-const AURA_ENGINE_ID: &[u8; 4] = b"aura";
-const BABE_ENGINE_ID: &[u8; 4] = b"BABE";
-const NIMBUS_ENGINE_ID: &[u8; 4] = b"nmbs";
-const POW_ENGINE_ID: &[u8; 4] = b"pow_";
+fn is_aura(engine: ConsensusEngineId) -> bool {
+    engine == [b'a', b'u', b'r', b'a']
+}
+fn is_babe(engine: ConsensusEngineId) -> bool {
+    engine == [b'B', b'A', b'B', b'E']
+}
+fn is_pow(engine: ConsensusEngineId) -> bool {
+    engine == [b'p', b'o', b'w', b'_']
+}
 
 #[subxt::subxt(runtime_metadata_path = "./metadata.scale")]
 pub mod polkadot {}
@@ -72,7 +80,19 @@ pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockRespon
     let parent_hash = block.header().parent_hash;
     let extrinsics_root = block.header().extrinsics_root;
     let logs = transform_logs(&block.header().digest.logs);
-    let author_id = get_author_id(State(state), block_hash, &block.header().digest.logs).await;
+
+    // Need help below with that error.
+    let validators = match client
+        .storage()
+        .at(block_hash)
+        .fetch(&polkadot::storage().session().validators())
+        .await
+    {
+        Ok(Some(validators)) => validators, // Unwrap the Result and Option
+        Ok(None) => vec![],                 // Default to an empty vector if no validators are found
+        Err(_) => vec![],                   // Handle error gracefully (log or handle as needed)
+    };
+    let author_id = extract_author(&block.header().digest.logs, validators);
 
     // Extract extrinsics
     let extrinsics_data = block
@@ -95,96 +115,49 @@ pub async fn get_latest_block(State(state): State<AppState>) -> Json<BlockRespon
     })
 }
 
-pub async fn get_author_id(
-    State(state): State<AppState>,
-    hash: H256,
-    logs: &[DigestItem],
+fn extract_author(
+    digest_logs: &Vec<DigestItem>,
+    validators: Vec<AccountId32>,
 ) -> Option<AccountId32> {
-    let client = &state.client;
-    let address = polkadot::storage().session().validators();
-    let validators = client.storage().at(hash).fetch(&address).await.unwrap();
-
-    extract_author(logs, &validators)
-}
-
-pub fn extract_author(
-    logs: &[DigestItem],
-    validators: &Option<Vec<AccountId32>>,
-) -> Option<AccountId32> {
-    let validators = validators.as_ref()?; // Safely unwrap the Option
-
     // Process PreRuntime logs first
-    if let Some(DigestItem::PreRuntime(engine_id, data)) = logs
+    if let Some(DigestItem::PreRuntime(engine, data)) = digest_logs
         .iter()
-        .find(|log| matches!(log, DigestItem::PreRuntime(_, _)))
+        .find(|item| matches!(item, DigestItem::PreRuntime(..)))
     {
-        if let Some(author) = extract_author_from_engine(engine_id, data, validators) {
-            return Some(author);
+        if is_babe(*engine) {
+            let mut data: &[u8] = data;
+
+            // Decode the PreDigest from the data, handling potential failures
+            let pre_digest = PreDigest::decode(&mut data).ok()?;
+            let authority_index = match pre_digest {
+                PreDigest::Primary(primary) => primary.authority_index,
+                PreDigest::SecondaryPlain(secondary) => secondary.authority_index,
+                PreDigest::SecondaryVRF(secondary) => secondary.authority_index,
+            };
+
+            // Safely retrieve the validator by the authority index
+            return validators.get(authority_index as usize).cloned();
+        } else if is_aura(*engine) {
+            // Aura uses the slot number modulo the validator count
+            let slot_number = u64::from_le_bytes(data[..8].try_into().ok()?);
+            let index = (slot_number as usize) % validators.len();
+            return validators.get(index).cloned();
         }
     }
 
-    // Process Consensus logs
-    if let Some(DigestItem::Consensus(engine_id, data)) = logs
+    // Process Consensus logs for PoW
+    if let Some(DigestItem::Consensus(engine, data)) = digest_logs
         .iter()
-        .find(|log| matches!(log, DigestItem::Consensus(_, _)))
+        .find(|item| matches!(item, DigestItem::Consensus(..)))
     {
-        if let Some(author) = extract_author_from_engine(engine_id, data, validators) {
-            return Some(author);
-        }
-    }
-
-    // Process Seal logs
-    if let Some(DigestItem::Seal(engine_id, data)) = logs
-        .iter()
-        .find(|log| matches!(log, DigestItem::Seal(_, _)))
-    {
-        if let Some(author) = extract_author_from_engine(engine_id, data, validators) {
-            return Some(author);
+        if is_pow(*engine) {
+            // PoW includes the author directly in the data
+            let account_id: [u8; 32] = data.clone().try_into().ok()?;
+            return Some(AccountId32::from(account_id));
         }
     }
 
     None
-}
-
-/// Extract the author based on the consensus engine.
-///
-/// # Arguments
-///
-/// - `engine_id`: The consensus engine ID.
-/// - `data`: The data associated with the digest item.
-/// - `validators`: The session validators, if applicable.
-///
-/// # Returns
-///
-/// The account ID of the author, if it can be determined.
-fn extract_author_from_engine(
-    engine_id: &[u8; 4],
-    data: &[u8],
-    validators: &[AccountId32],
-) -> Option<AccountId32> {
-    tracing::info!("Processing engine: {:?}", engine_id);
-    match engine_id {
-        // Aura: Author is derived from slot number modulo validators
-        AURA_ENGINE_ID => {
-            let raw_slot_number: [u8; 8] = data.get(..8)?.try_into().ok()?;
-            let slot_number = u64::from_le_bytes(raw_slot_number);
-            let index = (slot_number as usize) % validators.len();
-            Some(validators.get(index)?.clone())
-        }
-        // BABE: Author is determined by raw digest value
-        BABE_ENGINE_ID => {
-            let raw_slot_index: [u8; 4] = data.get(..4)?.try_into().ok()?;
-            let slot_index = u32::from_le_bytes(raw_slot_index);
-            validators.get(slot_index as usize).cloned()
-        }
-        // Nimbus & PoW: Author ID is stored directly in the digest data
-        NIMBUS_ENGINE_ID | POW_ENGINE_ID => {
-            let account_id: [u8; 32] = data.try_into().ok()?;
-            Some(AccountId32::from(account_id))
-        }
-        // Unknown engine
-        _ => None,
-    }
 }
 
 pub fn transform_logs(logs: &[DigestItem]) -> Vec<LogEntry> {
@@ -387,13 +360,13 @@ mod tests {
             *b"aura",
             vec![0, 0, 0, 0, 0, 0, 0, 1],
         )]; // Slot number = 1
-        let validators = Some(vec![
+        let validators = vec![
             AccountId32::from([0; 32]),
             AccountId32::from([1; 32]),
             AccountId32::from([2; 32]),
-        ]);
+        ];
 
-        let author = extract_author(&logs, &validators);
+        let author = extract_author(&logs, validators);
 
         assert_eq!(
             author,
@@ -405,13 +378,13 @@ mod tests {
     #[test]
     fn test_extract_author_babe() {
         let logs = vec![DigestItem::PreRuntime(*b"BABE", vec![2, 0, 0, 0])]; // Slot index = 2
-        let validators = Some(vec![
+        let validators = vec![
             AccountId32::from([0; 32]),
             AccountId32::from([1; 32]),
             AccountId32::from([2; 32]),
-        ]);
+        ];
 
-        let author = extract_author(&logs, &validators);
+        let author = extract_author(&logs, validators);
 
         assert_eq!(
             author,
@@ -423,13 +396,13 @@ mod tests {
     #[test]
     fn test_extract_author_nimbus() {
         let logs = vec![DigestItem::Seal(*b"nmbs", [1; 32].to_vec())]; // Author ID directly in data
-        let validators = Some(vec![
+        let validators = vec![
             AccountId32::from([0; 32]),
             AccountId32::from([1; 32]),
             AccountId32::from([2; 32]),
-        ]);
+        ];
 
-        let author = extract_author(&logs, &validators);
+        let author = extract_author(&logs, validators);
 
         assert_eq!(
             author,
@@ -441,9 +414,9 @@ mod tests {
     #[test]
     fn test_extract_author_no_validators() {
         let logs = vec![DigestItem::PreRuntime(*b"aura", vec![0; 8])]; // Slot number = 0
-        let validators: Option<Vec<AccountId32>> = None; // No validators provided
+        let validators: Vec<AccountId32> = None; // No validators provided
 
-        let author = extract_author(&logs, &validators);
+        let author = extract_author(&logs, validators);
 
         assert_eq!(author, None, "No validators should result in no author ID.");
     }
@@ -451,13 +424,13 @@ mod tests {
     #[test]
     fn test_extract_author_no_logs() {
         let logs: Vec<DigestItem> = vec![]; // No logs
-        let validators = Some(vec![
+        let validators = vec![
             AccountId32::from([0; 32]),
             AccountId32::from([1; 32]),
             AccountId32::from([2; 32]),
-        ]);
+        ];
 
-        let author = extract_author(&logs, &validators);
+        let author = extract_author(&logs, validators);
 
         assert_eq!(author, None, "No logs should result in no author ID.");
     }
@@ -465,13 +438,13 @@ mod tests {
     #[test]
     fn test_extract_author_invalid_slot_index() {
         let logs = vec![DigestItem::PreRuntime(*b"BABE", vec![255, 255, 255, 255])]; // Invalid slot index
-        let validators = Some(vec![
+        let validators = vec![
             AccountId32::from([0; 32]),
             AccountId32::from([1; 32]),
             AccountId32::from([2; 32]),
-        ]);
+        ];
 
-        let author = extract_author(&logs, &validators);
+        let author = extract_author(&logs, validators);
 
         assert_eq!(
             author, None,
