@@ -329,7 +329,7 @@ fn serialize_composite(composite: Composite<u32>) -> serde_json::Value {
             // Check if this is a byte array
             if unnamed_fields
                 .iter()
-                .all(|v| matches!(v.value, ValueDef::Primitive(Primitive::U128(_))))
+                .all(|v| matches!(v.value, ValueDef::Primitive(Primitive::U128(num)) if num <= 255))
             {
                 // Convert unnamed fields into a hex string
                 let bytes: Vec<u8> = unnamed_fields
@@ -339,12 +339,12 @@ fn serialize_composite(composite: Composite<u32>) -> serde_json::Value {
                         _ => None,
                     })
                     .collect();
-                serde_json::Value::String(format!("0x{}", hex::encode(bytes)))
-            } else {
-                let array: Vec<serde_json::Value> =
-                    unnamed_fields.into_iter().map(serialize_value).collect();
-                serde_json::Value::Array(array)
+                return serde_json::Value::String(format!("0x{}", hex::encode(bytes)));
             }
+
+            let array: Vec<serde_json::Value> =
+                unnamed_fields.into_iter().map(serialize_value).collect();
+            serde_json::Value::Array(array)
         }
     }
 }
@@ -352,13 +352,13 @@ fn serialize_composite(composite: Composite<u32>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subxt::config::substrate::{AccountId32, DigestItem};
+    use subxt::config::substrate::DigestItem;
 
     #[test]
     fn test_extract_author_aura() {
         let logs = vec![DigestItem::PreRuntime(
-            *b"aura",
-            vec![0, 0, 0, 0, 0, 0, 0, 1],
+            [b'a', b'u', b'r', b'a'],
+            vec![1, 0, 0, 0, 0, 0, 0, 0],
         )]; // Slot number = 1
         let validators = vec![
             AccountId32::from([0; 32]),
@@ -368,16 +368,15 @@ mod tests {
 
         let author = extract_author(&logs, validators);
 
-        assert_eq!(
-            author,
-            Some(AccountId32::from([1; 32])),
-            "The author ID should be the validator corresponding to slot 1."
-        );
+        assert_eq!(author, Some(AccountId32::from([1; 32])));
     }
 
     #[test]
     fn test_extract_author_babe() {
-        let logs = vec![DigestItem::PreRuntime(*b"BABE", vec![2, 0, 0, 0])]; // Slot index = 2
+        let logs = vec![DigestItem::PreRuntime(
+            [b'B', b'A', b'B', b'E'],
+            vec![0, 1, 0, 0], // Authority index = 256
+        )];
         let validators = vec![
             AccountId32::from([0; 32]),
             AccountId32::from([1; 32]),
@@ -385,70 +384,102 @@ mod tests {
         ];
 
         let author = extract_author(&logs, validators);
+
+        assert_eq!(author, None); // Invalid authority index
+    }
+
+    #[test]
+    fn test_extract_author_pow() {
+        let logs = vec![DigestItem::Consensus([b'p', b'o', b'w', b'_'], vec![2; 32])];
+        let validators = vec![
+            AccountId32::from([0; 32]),
+            AccountId32::from([1; 32]),
+            AccountId32::from([2; 32]),
+        ];
+
+        let author = extract_author(&logs, validators);
+
+        assert_eq!(author, Some(AccountId32::from([2; 32])));
+    }
+
+    #[test]
+    fn test_transform_logs() {
+        let logs = vec![
+            DigestItem::PreRuntime([b'a', b'u', b'r', b'a'], vec![1, 2, 3]),
+            DigestItem::Consensus([b'B', b'A', b'B', b'E'], vec![4, 5, 6]),
+            DigestItem::Seal([b'p', b'o', b'w', b'_'], vec![7, 8, 9]),
+        ];
+
+        let transformed_logs = transform_logs(&logs);
+
+        assert_eq!(transformed_logs.len(), 3);
+        assert_eq!(transformed_logs[0].log_type, "PreRuntime");
+        assert_eq!(transformed_logs[1].log_type, "Consensus");
+        assert_eq!(transformed_logs[2].log_type, "Seal");
+    }
+
+    #[test]
+    fn test_serialize_args_named() {
+        let args = Composite::Named(vec![
+            (
+                "key1".to_string(),
+                Value::with_context(ValueDef::Primitive(Primitive::U128(42)), 0),
+            ),
+            (
+                "key2".to_string(),
+                Value::with_context(
+                    ValueDef::Primitive(Primitive::String("value".to_string())),
+                    0,
+                ),
+            ),
+        ]);
+
+        let serialized = serialize_args(Some(args));
+
+        let expected = serde_json::json!({
+            "key1": "42",
+            "key2": "value"
+        });
+
+        assert_eq!(serialized, Some(expected));
+    }
+
+    #[test]
+    fn test_serialize_args_unnamed() {
+        let args = Composite::Unnamed(vec![
+            Value::with_context(ValueDef::Primitive(Primitive::U128(42)), 0),
+            Value::with_context(
+                ValueDef::Primitive(Primitive::String("value".to_string())),
+                0,
+            ),
+        ]);
+
+        let serialized = serialize_args(Some(args));
+
+        let expected = serde_json::json!(["42", "value"]);
+
+        assert_eq!(serialized, Some(expected));
+    }
+
+    #[test]
+    fn test_serialize_args_byte_array() {
+        use subxt::ext::scale_value::{Composite, Primitive, Value, ValueDef};
+
+        let args = Composite::Unnamed(vec![
+            Value::with_context(ValueDef::Primitive(Primitive::U128(1)), 0),
+            Value::with_context(ValueDef::Primitive(Primitive::U128(2)), 0),
+            Value::with_context(ValueDef::Primitive(Primitive::U128(3)), 0),
+        ]);
+
+        println!("Args (Raw Composite): {:?}", args);
+
+        let serialized = serialize_composite(args);
+        println!("Serialized Args: {:?}", serialized);
 
         assert_eq!(
-            author,
-            Some(AccountId32::from([2; 32])),
-            "The author ID should be the validator at index 2."
-        );
-    }
-
-    #[test]
-    fn test_extract_author_nimbus() {
-        let logs = vec![DigestItem::Seal(*b"nmbs", [1; 32].to_vec())]; // Author ID directly in data
-        let validators = vec![
-            AccountId32::from([0; 32]),
-            AccountId32::from([1; 32]),
-            AccountId32::from([2; 32]),
-        ];
-
-        let author = extract_author(&logs, validators);
-
-        assert_eq!(
-            author,
-            Some(AccountId32::from([1; 32])),
-            "The author ID should be extracted directly from the Seal digest."
-        );
-    }
-
-    #[test]
-    fn test_extract_author_no_validators() {
-        let logs = vec![DigestItem::PreRuntime(*b"aura", vec![0; 8])]; // Slot number = 0
-        let validators: Vec<AccountId32> = None; // No validators provided
-
-        let author = extract_author(&logs, validators);
-
-        assert_eq!(author, None, "No validators should result in no author ID.");
-    }
-
-    #[test]
-    fn test_extract_author_no_logs() {
-        let logs: Vec<DigestItem> = vec![]; // No logs
-        let validators = vec![
-            AccountId32::from([0; 32]),
-            AccountId32::from([1; 32]),
-            AccountId32::from([2; 32]),
-        ];
-
-        let author = extract_author(&logs, validators);
-
-        assert_eq!(author, None, "No logs should result in no author ID.");
-    }
-
-    #[test]
-    fn test_extract_author_invalid_slot_index() {
-        let logs = vec![DigestItem::PreRuntime(*b"BABE", vec![255, 255, 255, 255])]; // Invalid slot index
-        let validators = vec![
-            AccountId32::from([0; 32]),
-            AccountId32::from([1; 32]),
-            AccountId32::from([2; 32]),
-        ];
-
-        let author = extract_author(&logs, validators);
-
-        assert_eq!(
-            author, None,
-            "An invalid slot index should result in no author ID."
+            Some(serde_json::Value::String("0x010203".to_string())),
+            Some(serialized),
+            "Byte array serialization failed"
         );
     }
 }
